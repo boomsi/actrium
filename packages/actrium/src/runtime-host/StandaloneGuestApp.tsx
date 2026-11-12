@@ -107,6 +107,20 @@ const logToNative = (message: string) => {
   }
 };
 
+/**
+ * RN's Clipboard JS wrapper is deprecated; call the native module directly.
+ * RCTClipboard is part of react-native-macos and exports `setString`.
+ */
+const writeClipboardText = async (text: string): Promise<void> => {
+  const clipboard = NativeModules.Clipboard as
+    | { setString?: (value: string) => void }
+    | undefined;
+  if (!clipboard?.setString) {
+    throw new Error('The host clipboard module is not available.');
+  }
+  clipboard.setString(text);
+};
+
 export const StandaloneGuestApp: React.FC<Props> = ({
   tab,
   containerWidth,
@@ -118,6 +132,10 @@ export const StandaloneGuestApp: React.FC<Props> = ({
   const hasServiceCapability = hasDeclaredCapability(
     tab.permissions ?? [],
     'service'
+  );
+  const hasClipboardCapability = hasDeclaredCapability(
+    tab.permissions ?? [],
+    'host:clipboard.write'
   );
   const permissionsKey = [...(tab.permissions ?? [])].sort().join(',');
 
@@ -203,6 +221,8 @@ export const StandaloneGuestApp: React.FC<Props> = ({
     const hostModules = createHostModules({
       hasServiceCapability,
       callActor: callServiceActor,
+      hasClipboardCapability,
+      writeClipboardText,
     });
     const engine = new Engine({ debug: false, contract, hostModules });
     engine.register(hostComponents);
@@ -309,6 +329,7 @@ export const StandaloneGuestApp: React.FC<Props> = ({
     tab.id,
     tab.legacyActorBridge,
     tab.serviceCallUrl,
+    hasClipboardCapability,
     tab.reloadKey,
     tab.capabilityManifestJSON,
     permissionsKey,
