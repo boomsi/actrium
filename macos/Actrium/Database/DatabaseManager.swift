@@ -35,7 +35,7 @@ final class DatabaseManager {
         logger.notice("Initialized at: \(path)")
     }
 
-    static func appDataDirectory(in applicationSupport: URL) -> URL {
+    nonisolated static func appDataDirectory(in applicationSupport: URL) -> URL {
         applicationSupport.appendingPathComponent("Actro", isDirectory: true)
     }
 

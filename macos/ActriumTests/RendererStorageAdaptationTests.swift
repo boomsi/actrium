@@ -1,5 +1,6 @@
 import ActriumCore
 import ActriumIPC
+import CryptoKit
 import Foundation
 import Testing
 @testable import Actrium

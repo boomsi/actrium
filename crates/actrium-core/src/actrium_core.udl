@@ -1695,11 +1695,15 @@ enum GuestLocalStorageError {
     "IdentityChanged",
     "MigrationRequired",
     "MigrationConflict",
+    "DatabaseUnlockFailed",
+    "EncryptionUnavailable",
 };
 
 /// A profile database. Callers supply an origin from the authorized Host document.
 interface GuestLocalStorage {
     constructor(string path);
+    [Name=new_encrypted, Throws=GuestLocalStorageError]
+    constructor(string path, bytes key);
     [Throws=GuestLocalStorageError]
     PublisherProfileAcceptance accept_publisher_profile(string body, string domain, string? previous_pins_json, string? previous_profile_body);
     [Throws=GuestLocalStorageError]
