@@ -3,6 +3,7 @@
 //! Provides semantic fingerprinting capabilities for proto files and services
 //! using proto-sign analysis that ignores formatting differences.
 
+use crate::spec_builder::{ACTR_OPTIONS_IMPORT, self_contained_proto_hash};
 use crate::{CompatibilityError, ProtoFile, Result};
 use sha2::{Digest, Sha256};
 
@@ -17,10 +18,9 @@ impl Fingerprint {
     /// Calculate semantic fingerprint for a single proto file
     /// This uses proto-sign analysis and ignores formatting differences
     pub fn calculate_proto_semantic_fingerprint(proto_content: &str) -> Result<String> {
-        let spec = proto_fingerprint::Spec::try_from(proto_content)
-            .map_err(CompatibilityError::ProtoSignError)?;
-
-        Ok(format!("semantic:{}", spec.fingerprint))
+        let hash =
+            semantic_proto_hash(proto_content).map_err(CompatibilityError::ProtoSignError)?;
+        Ok(format!("semantic:{hash}"))
     }
 
     // Removed: calculate_proto_fingerprints() - content fingerprints are not semantically meaningful
@@ -34,13 +34,13 @@ impl Fingerprint {
     pub fn calculate_service_semantic_fingerprint(proto_files: &[ProtoFile]) -> Result<String> {
         let mut semantic_fingerprints = Vec::with_capacity(proto_files.len());
         for file in proto_files {
-            let spec = proto_fingerprint::Spec::try_from(file.content.as_str()).map_err(|e| {
+            let hash = semantic_proto_hash(&file.content).map_err(|e| {
                 CompatibilityError::ProtoParseError {
                     file_name: file.name.clone(),
                     source: e,
                 }
             })?;
-            semantic_fingerprints.push((file.name.clone(), spec.fingerprint));
+            semantic_fingerprints.push((file.name.clone(), hash));
         }
         Ok(Self::service_fingerprint_from_hashes(semantic_fingerprints))
     }
@@ -56,6 +56,18 @@ impl Fingerprint {
     }
 
     // Removed: calculate_service_fingerprints() - content fingerprints are not semantically meaningful
+}
+
+fn semantic_proto_hash(source: &str) -> anyhow::Result<String> {
+    let dependencies = protobuf_parse::pure::parse_dependencies(source)?;
+    if dependencies
+        .dependency
+        .iter()
+        .any(|path| path == ACTR_OPTIONS_IMPORT)
+    {
+        return self_contained_proto_hash(source);
+    }
+    Ok(proto_fingerprint::Spec::try_from(source)?.fingerprint)
 }
 
 // =========================================================================
@@ -113,6 +125,37 @@ mod tests {
         let semantic_fp2 = Fingerprint::calculate_proto_semantic_fingerprint(content2).unwrap();
 
         assert_eq!(semantic_fp1, semantic_fp2);
+    }
+
+    #[test]
+    fn actr_options_resolve_for_fingerprints_and_packed_contracts() {
+        let source = r#"
+            syntax = "proto3";
+            package test;
+            import "actr/options.proto";
+            message Request {}
+            service Test {
+                rpc Run(Request) returns (Request) {
+                    option (actr.reply_mode) = REPLY_MODE_EXPLICIT;
+                }
+            }
+        "#;
+        let legacy = Fingerprint::calculate_proto_semantic_fingerprint(source).unwrap();
+        let packaged = crate::build_self_contained_service_spec(
+            "test",
+            ProtoFile {
+                name: "test.proto".into(),
+                content: source.into(),
+                path: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy, packaged.protobufs[0].fingerprint);
+        assert!(
+            crate::spec_builder::self_contained_unary_routes(source)
+                .unwrap()
+                .contains("test.Test.Run")
+        );
     }
 
     #[test]

@@ -11,6 +11,9 @@
 /// Current schema version emitted by [`SignalingEnvelope`] writers.
 pub const SIGNALING_ENVELOPE_VERSION: u32 = 2;
 
+/// Built-in method options available to packaged Actr service contracts.
+pub const ACTR_OPTIONS_PROTO: &str = include_str!("../proto/actr/options.proto");
+
 // Include generated protobuf code from prost
 pub mod generated {
     pub mod actr {
