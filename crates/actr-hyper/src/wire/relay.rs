@@ -44,6 +44,10 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024 + 64;
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
+// Admit a maximum-size frame while leaving part of the shared budget for other peers.
+const CHANNEL_RECEIVE_BYTES: usize = 12 * 1024 * 1024;
+// Account for queue and allocation overhead even when the encrypted record is tiny.
+const MIN_RECEIVE_RECORD_CHARGE: usize = 1024;
 const OUTGOING_QUEUE_SLOTS: usize = 128;
 const CLOSE_QUEUE_SLOTS: usize = 512;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -219,6 +223,7 @@ impl Drop for PendingGuard {
 }
 struct Channel {
     security: Arc<Mutex<SecureSession>>,
+    receive_budget: Arc<Semaphore>,
     receive_permits: Mutex<Vec<OwnedSemaphorePermit>>,
     connected: AtomicBool,
     actrium: bool,
@@ -226,7 +231,7 @@ struct Channel {
     created: tokio::time::Instant,
     peer: ActrId,
     conn: WebSocketConnection,
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::UnboundedSender<Message>,
     ready: watch::Sender<bool>,
     cancel: CancellationToken,
 }
@@ -497,7 +502,7 @@ impl RelayClient {
             self.status.send_replace(Status::Reconnecting);
             self.clear().await;
             if let Err(error) = result {
-                tracing::debug!(error = %error, "Relay reconnect scheduled");
+                tracing::warn!(error = %error, "Relay transport failed; reconnect scheduled");
             }
             let delay =
                 Duration::from_millis(backoff_ms + rand::random::<u64>() % (backoff_ms / 4 + 1));
@@ -536,7 +541,10 @@ impl RelayClient {
             ),
         )
         .await
-        .map_err(|_| closed())??;
+        .map_err(|_| {
+            tracing::warn!("Timed out opening Relay WebSocket");
+            closed()
+        })??;
         if response
             .headers()
             .get("sec-websocket-protocol")
@@ -557,18 +565,29 @@ impl RelayClient {
             socket.send(Message::Text(serde_json::to_string(&hello).unwrap().into())),
         )
         .await
-        .map_err(|_| closed())??;
+        .map_err(|_| {
+            tracing::warn!("Timed out sending Relay authentication hello");
+            closed()
+        })??;
         let welcome = timer::timeout(timer::ids::RELAY_AUTHENTICATION, IO_TIMEOUT, socket.next())
             .await
-            .map_err(|_| closed())?
-            .ok_or_else(closed)??;
+            .map_err(|_| {
+                tracing::warn!("Timed out waiting for Relay welcome");
+                closed()
+            })?
+            .ok_or_else(|| {
+                tracing::warn!("Relay WebSocket ended before welcome");
+                closed()
+            })??;
         let Message::Text(text) = welcome else {
+            tracing::warn!("Relay did not send a welcome text frame");
             return Err(closed());
         };
         if !matches!(
             serde_json::from_str::<ServerControl>(&text),
             Ok(ServerControl::Welcome { .. })
         ) {
+            tracing::warn!("Relay welcome was invalid or rejected");
             return Err(closed());
         }
         let (mut sink, mut stream) = socket.split();
@@ -623,7 +642,11 @@ impl RelayClient {
                     let expired: Vec<_> = self.channels.read().await.iter().filter_map(|(id, entry)| {
                         (!*entry.ready.borrow() && entry.created.elapsed() > Duration::from_secs(10)).then_some(*id)
                     }).collect();
-                    for id in expired { self.close_channel(id).await; transport.try_close(id); }
+                    for id in expired {
+                        tracing::warn!(channel_id = id, "Relay secure handshake expired locally");
+                        self.close_channel(id).await;
+                        transport.try_close(id);
+                    }
                     if current.generation != generation || (expires_at.saturating_sub(now) < 30 && current.credential.encode_to_vec() != initial_token) { break Ok(()); }
                 }
                 message = stream.next() => match message {
@@ -636,7 +659,7 @@ impl RelayClient {
                     Some(Ok(Message::Binary(frame))) => {
                         let (channel_id, payload) = match decode_data(frame, MAX_FRAME) { Ok(frame) => frame, Err(_) => break Err(closed()) };
                         if let Err(error) = self.receive_secure(channel_id, payload, &transport, &budget).await {
-                            tracing::debug!(channel_id, %error, "Relay secure channel rejected");
+                            tracing::warn!(channel_id, %error, "Relay secure channel rejected");
                             self.close_channel(channel_id).await;
                             transport.try_close(channel_id);
                         }
@@ -700,7 +723,8 @@ impl RelayClient {
                 false,
             )
         };
-        let (tx, rx) = mpsc::channel::<Message>(16);
+        // The receive byte budgets bound the queue without blocking the shared reader.
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
         let (ready, ready_rx) = watch::channel(false);
         let cancel = transport.cancel.child_token();
         let write_cancel = cancel.child_token();
@@ -771,7 +795,7 @@ impl RelayClient {
             }
             Ok::<_, WsError>(state)
         });
-        let incoming = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok);
+        let incoming = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(Ok);
         let conn = if actrium {
             WebSocketConnection::from_actrium_encrypted_parts(
                 Box::pin(sink),
@@ -783,6 +807,7 @@ impl RelayClient {
         };
         let entry = Arc::new(Channel {
             security,
+            receive_budget: Arc::new(Semaphore::new(CHANNEL_RECEIVE_BYTES)),
             receive_permits: Mutex::new(Vec::new()),
             connected: AtomicBool::new(false),
             actrium,
@@ -928,8 +953,16 @@ impl RelayClient {
                 }
             }
             ServerControl::Closed {
-                channel, request, ..
+                channel,
+                reason,
+                request,
             } => {
+                tracing::warn!(
+                    channel_id = channel,
+                    ?request,
+                    ?reason,
+                    "Relay reported channel closed"
+                );
                 if let Some(request) = request {
                     if let Some(pending) = self.pending.lock().unwrap().remove(&request) {
                         let _ = pending.reply.send(Err(closed()));
@@ -1069,7 +1102,16 @@ impl RelayClient {
                 }
                 tokio::select! { _ = self.shutdown.cancelled() => return Err(closed()), result = status.changed() => result.map_err(|_| closed())? }
             }
-        }).await.map_err(|_| closed())??;
+        }).await.map_err(|_| {
+            let relay_state = match &*status.borrow() {
+                Status::Discovering => "discovering",
+                Status::Disabled => "disabled",
+                Status::Reconnecting => "reconnecting",
+                Status::Ready(_) => "ready",
+            };
+            tracing::warn!(%peer, relay_state, "Timed out waiting for Relay transport readiness");
+            closed()
+        })??;
         let request = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
@@ -1090,12 +1132,22 @@ impl RelayClient {
             })
             .await
         {
+            tracing::warn!(%peer, request, %error, "Failed to send Relay peer connect request");
             self.pending.lock().unwrap().remove(&request);
             return Err(error);
         }
         let result = tokio::select! {
             _ = self.shutdown.cancelled() => Err(closed()),
-            result = timer::timeout(timer::ids::RELAY_CHANNEL_CONNECT, CONNECT_TIMEOUT, rx) => result.map_err(|_| closed()).and_then(|result| result.map_err(|_| closed())).and_then(|result| result),
+            result = timer::timeout(timer::ids::RELAY_CHANNEL_CONNECT, CONNECT_TIMEOUT, rx) => result
+                .map_err(|_| {
+                    tracing::warn!(%peer, request, "Timed out waiting for Relay peer handshake");
+                    closed()
+                })
+                .and_then(|result| result.map_err(|_| {
+                    tracing::warn!(%peer, request, "Relay peer handshake reply dropped");
+                    closed()
+                }))
+                .and_then(|result| result),
         };
         self.pending.lock().unwrap().remove(&request);
         result
@@ -1407,7 +1459,10 @@ impl RelayClient {
                     self.heal_actor_key_binding(&actor).await?;
                     continue;
                 }
-                Err(_) => return Err(closed()),
+                Err(http_status) => {
+                    tracing::warn!(actor_id = %endpoint, ?http_status, "Relay identity enrollment failed");
+                    return Err(closed());
+                }
             };
             let actor_certificate = issued.actor_certificate.clone();
             let identity = Arc::new(
@@ -1565,10 +1620,28 @@ impl RelayClient {
         if !entry.connected.load(Ordering::Acquire) {
             return Err(closed());
         }
-        let permit = budget
+        let charge = payload.len().max(MIN_RECEIVE_RECORD_CHARGE) as u32;
+        let channel_permit = entry
+            .receive_budget
             .clone()
-            .try_acquire_many_owned(payload.len().max(1) as u32)
-            .map_err(|_| closed())?;
+            .try_acquire_many_owned(charge)
+            .map_err(|_| {
+                tracing::warn!(
+                    channel_id = id,
+                    charge,
+                    "Relay channel receive budget exhausted"
+                );
+                closed()
+            })?;
+        let shared_permit = budget.clone().try_acquire_many_owned(charge).map_err(|_| {
+            tracing::warn!(
+                channel_id = id,
+                charge,
+                "Shared Relay receive budget exhausted"
+            );
+            closed()
+        })?;
+        let record_permits = [channel_permit, shared_permit];
         let issuer = if let Some(id) = signing_key_id(&payload).map_err(secure_error)? {
             Some(self.issuer(id).await?)
         } else {
@@ -1600,16 +1673,19 @@ impl RelayClient {
                 return Err(closed());
             }
             let mut permits = std::mem::take(&mut *entry.receive_permits.lock().await);
-            permits.push(permit);
+            permits.extend(record_permits);
             entry
                 .tx
-                .try_send(Message::Binary(Bytes::from_owner(BudgetedPayload {
+                .send(Message::Binary(Bytes::from_owner(BudgetedPayload {
                     payload: application.into(),
                     _permits: permits,
                 })))
-                .map_err(|_| closed())?;
+                .map_err(|_| {
+                    tracing::warn!(channel_id = id, peer = %entry.peer, "Relay receive queue receiver is closed");
+                    closed()
+                })?;
         } else if partial != 0 {
-            entry.receive_permits.lock().await.push(permit);
+            entry.receive_permits.lock().await.extend(record_permits);
         }
         Ok(())
     }

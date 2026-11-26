@@ -10,6 +10,9 @@ use actr_runtime_mailbox::{Mailbox, MailboxStats, MessagePriority, MessageRecord
 use ed25519_dalek::{Signer, SigningKey};
 use uuid::Uuid;
 
+#[path = "relay_receive_tests.rs"]
+mod receive_tests;
+
 struct EmptyMailbox;
 
 #[tokio::test]
