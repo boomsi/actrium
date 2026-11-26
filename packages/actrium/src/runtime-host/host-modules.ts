@@ -5,6 +5,7 @@ import type {
   ClipboardWriteTextInput,
   TabSetTitleInput,
   LocalStorageKeyInput,
+  LocalStorageReplaceInput,
   LocalStorageSetInput,
   FileImportPickInput,
   FileImportPickOutput,
@@ -54,7 +55,7 @@ export const HOST_SUPPORTED_METHODS: Readonly<Record<string, ReadonlySet<string>
   'host:service-stream': new Set(['register', 'unregister', 'onChunk', 'send']),
   'host:clipboard': new Set(['writeText']),
   'host:tab': new Set(['setTitle']),
-  'host:local-storage': new Set(['getItem', 'setItem', 'removeItem']),
+  'host:local-storage': new Set(['getItem', 'setItem', 'removeItem', 'replaceItems']),
   'host:speech': new Set(['recognize', 'onInterimResult', 'stop', 'onStateChange']),
   'host:tts': new Set(['speak', 'stop']),
   'host:file-import': new Set(['pick', 'openPreview', 'release']),
@@ -295,6 +296,9 @@ export function createHostModules(options: {
       },
       removeItem: async (input: LocalStorageKeyInput) => {
         await localStorage('removeItem', input);
+      },
+      replaceItems: async (input: LocalStorageReplaceInput) => {
+        await localStorage('replaceItems', input);
       },
     },
     'host:notifications': {
