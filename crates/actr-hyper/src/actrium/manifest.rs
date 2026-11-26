@@ -19,6 +19,7 @@ use crate::error::HyperError;
 pub const ACTRIUM_VERSION_V1: &str = "1.0.0";
 pub const FRONT_HOST_API_V1: &str = "1.0";
 pub const SERVICE_CAPABILITY: &str = "service";
+pub(crate) const SERVICE_STREAM_SEND_CAPABILITY: &str = "host:service-stream.send";
 pub const ATTACHMENT_UPLOAD_TRANSPORT: &str = "uploadAttachment";
 pub const ATTACHMENT_PREPARE_ROUTE: &str = "ask.AskService.PrepareAttachmentUpload";
 pub const ATTACHMENT_CANCEL_ROUTE: &str =
@@ -175,6 +176,21 @@ pub fn front_session_metadata(
                 "service.attachmentUpload" | "host:service.uploadAttachment"
             )
         });
+    let stream_send_permitted = front_manifest
+        .host
+        .required_capabilities
+        .iter()
+        .any(|capability| capability == SERVICE_STREAM_SEND_CAPABILITY)
+        && capabilities
+            .host_modules
+            .get("service-stream")
+            .or_else(|| capabilities.host_modules.get("host:service-stream"))
+            .and_then(|module| module.rpc.as_ref())
+            .is_some_and(|routes| routes.iter().any(|route| route == "send"));
+    let mut program_capabilities = BTreeSet::from([SERVICE_CAPABILITY.to_owned()]);
+    if stream_send_permitted {
+        program_capabilities.insert(SERVICE_STREAM_SEND_CAPABILITY.to_owned());
+    }
     let routes: BTreeMap<String, BTreeSet<String>> = route_names
         .into_iter()
         .filter(|route| route.as_str() != ATTACHMENT_UPLOAD_TRANSPORT || upload_permitted)
@@ -227,7 +243,7 @@ pub fn front_session_metadata(
             front_host_api: FRONT_HOST_API_V1.to_owned(),
             keel_api: capabilities.keel_api,
         },
-        program_capabilities: BTreeSet::from([SERVICE_CAPABILITY.to_owned()]),
+        program_capabilities,
         routes,
     })
 }

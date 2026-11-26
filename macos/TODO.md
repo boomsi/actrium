@@ -40,3 +40,11 @@
 ### WP-E: Ad Blocking (P2) → [Todo-E.md](./Todo-E.md)
 - E1. WKContentRuleList with bundled rules
 - E2. Settings toggle + user-configurable rules
+
+## DeepSeek Chat Service Integration
+
+- [x] Add the text-only Responses flow. The Guest registers through `host:service-stream` before `CreateResponse`. The macOS bridge forwards reply frames with the stream ID and sequence, and the Guest unregisters after completion. The native demo Service echoes text on that stream using `responses.proto`.
+- [ ] Define stream resumption after reconnect using the stream ID and last contiguous sequence if needed. The Guest already uses `CancelStream.cancelled=true` to confirm a stop.
+- [x] Wire Responses attachment upload in the Front. Call `BeginUpload`, send chunks on the negotiated DataStream, and use the `FinishUpload` file ID in `CreateResponse`. Verified with a simulated Service.
+- [x] Wire Smart Search in the Front. Send `TOOL_WEB_SEARCH` from the toggle and show search sources and citations from the response stream. Verified with a simulated Service.
+- [ ] Integrate with the production Service for attachment upload and Web Search. Confirm which authenticated route is assigned to upload chunks and whether `FinishUpload` can return after file processing.

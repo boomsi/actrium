@@ -73,8 +73,7 @@ pub fn build_service_spec(input: ServiceSpecInput<'_>) -> Result<actr_protocol::
 }
 
 /// Build the spec for one RPC Proto from authenticated package contents.
-/// Imports are rejected before type resolution. Fingerprint the parsed
-/// descriptor directly so only the package's signed source is read.
+/// Resolve only platform-supplied options alongside the signed source.
 pub fn build_self_contained_service_spec(
     name: &str,
     proto: ProtoFile,
@@ -82,7 +81,7 @@ pub fn build_self_contained_service_spec(
     build_self_contained_service_spec_from_files(name, vec![proto])
 }
 
-/// Build a spec from authenticated RPC exports without resolving any imports.
+/// Build a spec from authenticated RPC exports with built-in Actr options.
 ///
 /// Every file must be self-contained. Service fingerprints use the same sorted
 /// name/hash aggregation as the legacy builder. Published-name collision keys use
@@ -125,14 +124,29 @@ pub fn build_self_contained_service_spec_from_files(
     ))
 }
 
+pub(crate) const ACTR_OPTIONS_IMPORT: &str = "actr/options.proto";
+
 fn self_contained_descriptor(
     source: &str,
 ) -> anyhow::Result<protobuf::descriptor::FileDescriptorProto> {
     let dependencies = protobuf_parse::pure::parse_dependencies(source)?;
-    if !dependencies.dependency.is_empty() {
-        bail!("the RPC Proto must be self-contained; imports are unsupported");
+    if dependencies
+        .dependency
+        .iter()
+        .any(|path| path != ACTR_OPTIONS_IMPORT)
+    {
+        bail!(
+            "the RPC Proto must be self-contained; imports are unsupported except actr/options.proto"
+        );
     }
     let dir = tempfile::tempdir()?;
+    if !dependencies.dependency.is_empty() {
+        std::fs::create_dir(dir.path().join("actr"))?;
+        std::fs::write(
+            dir.path().join(ACTR_OPTIONS_IMPORT),
+            actr_protocol::ACTR_OPTIONS_PROTO,
+        )?;
+    }
     let input = dir.path().join("input.proto");
     std::fs::write(&input, source)?;
     let descriptors = protobuf_parse::Parser::new()
@@ -148,14 +162,14 @@ fn self_contained_descriptor(
     Ok(descriptor)
 }
 
-fn self_contained_proto_hash(source: &str) -> anyhow::Result<String> {
+pub(crate) fn self_contained_proto_hash(source: &str) -> anyhow::Result<String> {
     let descriptor = self_contained_descriptor(source)?;
     let canonical = proto_fingerprint::normalize::normalize_file(&descriptor);
     let encoded = serde_json::to_string_pretty(&canonical)?;
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
-/// Verify that a standalone RPC Proto resolves all its types without imports.
+/// Verify that a standalone RPC Proto resolves its types with built-in Actr options.
 pub fn validate_self_contained_rpc_proto(source: &str) -> Result<()> {
     self_contained_proto_hash(source)
         .map(|_| ())

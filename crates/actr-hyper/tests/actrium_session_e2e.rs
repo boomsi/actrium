@@ -18,6 +18,9 @@ use actrium_runtime::{
 use async_trait::async_trait;
 use tempfile::TempDir;
 
+#[path = "actrium_session_e2e/reply_stream.rs"]
+mod reply_stream;
+
 const REALM: &str = "test7@example.com";
 const READ: &str = "documents.read";
 const PREPARE_ATTACHMENT_ROUTE: &str = "ask.AskService.PrepareAttachmentUpload";
@@ -57,7 +60,10 @@ impl RpcRequest for EchoRequest {
     }
 }
 
-struct EchoWorkload;
+#[derive(Default)]
+struct EchoWorkload {
+    reply_ready: Arc<tokio::sync::Notify>,
+}
 
 #[async_trait]
 impl Workload for EchoWorkload {
@@ -71,12 +77,13 @@ impl MessageDispatcher for EchoDispatcher {
     type Workload = EchoWorkload;
 
     async fn dispatch<C: Context>(
-        _workload: &Self::Workload,
+        workload: &Self::Workload,
         envelope: RpcEnvelope,
-        _ctx: &C,
+        ctx: &C,
     ) -> actr_protocol::ActorResult<Bytes> {
         match envelope.route_key.as_str() {
             "echo" => Ok(envelope.payload.unwrap_or_default()),
+            reply_stream::ROUTE => reply_stream::dispatch(ctx, workload.reply_ready.clone()),
             PREPARE_ATTACHMENT_ROUTE => {
                 let payload = envelope.payload.unwrap_or_default();
                 let request =
@@ -322,6 +329,15 @@ async fn register_node(
     dir: &TempDir,
     actor_type: ActrType,
 ) -> Node<actr_hyper::Registered> {
+    register_echo_node(server, dir, actor_type, EchoWorkload::default()).await
+}
+
+async fn register_echo_node(
+    server: &TestSignalingServer,
+    dir: &TempDir,
+    actor_type: ActrType,
+    workload: EchoWorkload,
+) -> Node<actr_hyper::Registered> {
     let hyper = Hyper::new(HyperConfig::new(
         dir.path(),
         Arc::new(StaticTrust::dev_only()),
@@ -330,7 +346,7 @@ async fn register_node(
     .unwrap();
     let config = runtime_config(dir, server, actor_type);
     Node::from_hyper(hyper, config)
-        .link(EchoWorkload)
+        .link(workload)
         .await
         .unwrap()
         .register(&format!("http://127.0.0.1:{}/issuer", server.port()))
@@ -401,21 +417,35 @@ async fn two_fronts_use_the_same_service_over_ordinary_relay() {
     let first_dir = TempDir::new().unwrap();
     let second_dir = TempDir::new().unwrap();
     let params = attach_params();
-    let service = register_node(&server, &service_dir, service_type())
-        .await
-        .with_ordinary_service_authorization(FrontSessionMetadata {
-            service_type: service_type(),
-            front_actor_type: front_type(),
-            package_digest: params.package_digest,
-            guest_digest: params.guest_digest,
-            protocol_fingerprint: params.protocol_fingerprint,
-            runtime: params.runtime,
-            program_capabilities: BTreeSet::from([READ.to_owned()]),
-            routes: BTreeMap::from([("echo".to_owned(), BTreeSet::from([READ.to_owned()]))]),
-        })
-        .start()
-        .await
-        .unwrap();
+    let reply_ready = Arc::new(tokio::sync::Notify::new());
+    let service = register_echo_node(
+        &server,
+        &service_dir,
+        service_type(),
+        EchoWorkload {
+            reply_ready: reply_ready.clone(),
+        },
+    )
+    .await
+    .with_ordinary_service_authorization(FrontSessionMetadata {
+        service_type: service_type(),
+        front_actor_type: front_type(),
+        package_digest: params.package_digest,
+        guest_digest: params.guest_digest,
+        protocol_fingerprint: params.protocol_fingerprint,
+        runtime: params.runtime,
+        program_capabilities: BTreeSet::from([READ.to_owned()]),
+        routes: BTreeMap::from([
+            ("echo".to_owned(), BTreeSet::from([READ.to_owned()])),
+            (
+                reply_stream::ROUTE.to_owned(),
+                BTreeSet::from([READ.to_owned()]),
+            ),
+        ]),
+    })
+    .start()
+    .await
+    .unwrap();
     let first = register_node(&server, &first_dir, front_type())
         .await
         .start()
@@ -443,7 +473,7 @@ async fn two_fronts_use_the_same_service_over_ordinary_relay() {
     };
     assert!(first.prepare_peer_rpc(&unknown, 500).await.is_err());
 
-    let target = Dest::Peer(service_id);
+    let target = Dest::Peer(service_id.clone());
     let first_context = first.app_context().await;
     let second_context = second.app_context().await;
     let first_payload = Bytes::from_static(b"first");
@@ -466,6 +496,7 @@ async fn two_fronts_use_the_same_service_over_ordinary_relay() {
     );
     assert_eq!(first_reply.unwrap(), first_payload);
     assert_eq!(second_reply.unwrap(), second_payload);
+    reply_stream::verify(&first, &second, &service_id, &reply_ready).await;
 
     let denied = first_context
         .call_raw(

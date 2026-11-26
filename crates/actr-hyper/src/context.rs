@@ -639,6 +639,22 @@ impl RuntimeContext {
         .await
     }
 
+    /// Register a stream callback that accepts chunks from one expected peer.
+    pub fn register_stream_from_peer<F>(
+        &self,
+        stream_id: String,
+        peer: ActrId,
+        callback: F,
+    ) -> ActorResult<()>
+    where
+        F: Fn(DataChunk, ActrId) -> MaybeSendBoxFuture<'static, ActorResult<()>>
+            + MaybeSendSync
+            + 'static,
+    {
+        self.data_chunk_registry
+            .register_with_owner(stream_id, Arc::new(callback), Some(peer))
+    }
+
     /// Get dependency fingerprint from the packaged manifest.lock.toml
     fn get_dependency_fingerprint(&self, target_type: &ActrType) -> Option<String> {
         self.dependency_fingerprints.get(target_type).cloned()

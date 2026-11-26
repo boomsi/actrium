@@ -871,21 +871,24 @@ impl ActrRefWrapper {
         stream_id: String,
         callback: Box<dyn crate::context::DataChunkCallback>,
     ) -> ActrResult<()> {
-        let callback: Arc<dyn crate::context::DataChunkCallback> = Arc::from(callback);
-        self.inner
-            .app_context()
+        self.register_stream_callback(stream_id, None, callback)
             .await
-            .register_stream(stream_id, move |chunk, sender| {
-                let callback = callback.clone();
-                Box::pin(async move {
-                    callback
-                        .on_stream(chunk.into(), sender.into())
-                        .await
-                        .map_err(actr_protocol::ActrError::from)
-                })
-            })
-            .await?;
-        Ok(())
+    }
+
+    /// Register a Front DataStream for the selected Service Actor.
+    pub async fn register_service_stream(
+        &self,
+        stream_id: String,
+        service: ActrId,
+        callback: Box<dyn crate::context::DataChunkCallback>,
+    ) -> ActrResult<()> {
+        if self.front_event_router.is_none() {
+            return Err(ActrError::InvalidArgument {
+                msg: "This actor was not created as a Front".into(),
+            });
+        }
+        self.register_stream_callback(stream_id, Some(service.into()), callback)
+            .await
     }
 
     /// Unregister a DataChunk callback for a stream ID.
@@ -912,6 +915,38 @@ impl ActrRefWrapper {
         )
         .await?;
 
+        Ok(())
+    }
+}
+
+impl ActrRefWrapper {
+    async fn register_stream_callback(
+        &self,
+        stream_id: String,
+        peer: Option<actr_protocol::ActrId>,
+        callback: Box<dyn crate::context::DataChunkCallback>,
+    ) -> ActrResult<()> {
+        let callback: Arc<dyn crate::context::DataChunkCallback> = Arc::from(callback);
+        let handler = move |chunk: actr_protocol::DataChunk,
+                            sender: actr_protocol::ActrId|
+              -> actr_framework::MaybeSendBoxFuture<
+            'static,
+            actr_protocol::ActorResult<()>,
+        > {
+            let callback = callback.clone();
+            Box::pin(async move {
+                callback
+                    .on_stream(chunk.into(), sender.into())
+                    .await
+                    .map_err(actr_protocol::ActrError::from)
+            })
+        };
+        let context = self.inner.app_context().await;
+        if let Some(peer) = peer {
+            context.register_stream_from_peer(stream_id, peer, handler)?;
+        } else {
+            context.register_stream(stream_id, handler).await?;
+        }
         Ok(())
     }
 }

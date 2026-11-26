@@ -406,6 +406,15 @@ impl DataChunkRegistry {
         } else {
             None
         };
+        self.register_with_owner(stream_id, callback, owner)
+    }
+
+    pub(crate) fn register_with_owner(
+        &self,
+        stream_id: String,
+        callback: DataChunkCallback,
+        owner: Option<ActrId>,
+    ) -> ActorResult<()> {
         let mut state = self
             .inner
             .state
